@@ -81,14 +81,63 @@ static void getBackwardSliceSimple(Operation *rootOp,
   backwardSlice.remove(rootOp);
 }
 
+static bool isDataflowOp(Operation *testOp) {
+  return !isa<sv::ReadInOutOp>(testOp) && !isa<hw::InstanceOp>(testOp) &&
+         !isa<sv::PAssignOp>(testOp) && !isa<sv::BPAssignOp>(testOp);
+}
+
 // Compute the dataflow for a set of ops.
 static void dataflowSlice(SetVector<Operation *> &ops,
                           SetVector<Operation *> &results) {
-  for (auto op : ops) {
-    getBackwardSliceSimple(op, results, [](Operation *testOp) -> bool {
-      return !isa<sv::ReadInOutOp>(testOp) && !isa<hw::InstanceOp>(testOp) &&
-             !isa<sv::PAssignOp>(testOp) && !isa<sv::BPAssignOp>(testOp);
+  for (auto op : ops)
+    getBackwardSliceSimple(op, results, isDataflowOp);
+}
+
+static bool resultsOnlyUsedInSlice(Operation *op,
+                                   const SetVector<Operation *> &slice) {
+  return llvm::all_of(op->getResults(), [slice](OpResult result) {
+    return llvm::all_of(result.getUsers(), [slice](Operation *user) {
+      return slice.contains(user);
     });
+  });
+}
+
+static void nonDataFlowSlice(SetVector<Operation *> &slice) {
+  // Compute set of wire reads that only feed into the slice, and add them to
+  // the slice.
+  SmallVector<ReadInOutOp> reads;
+  for (auto *op : slice)
+    for (auto operand : op->getOperands())
+      if (auto readInOut =
+              dyn_cast_or_null<sv::ReadInOutOp>(operand.getDefiningOp()))
+        if (resultsOnlyUsedInSlice(readInOut, slice))
+          reads.push_back(readInOut);
+
+  // Traverse the wires being read from and gather their assigns.
+  SetVector<Operation *> assigns;
+  for (auto read : reads) {
+    // Add the read to the dataflow slice.
+    slice.insert(read);
+
+    // Track the assign(s) to the wire being read.
+    Operation *wire = read.input().getDefiningOp();
+    for (auto *user : wire->getUsers())
+      if (isa<sv::AssignOp>(user))
+        assigns.insert(user);
+  }
+
+  // Traverse the assigns, adding to the slice.
+  for (auto *op : assigns) {
+    // Take backward dataflow slices from the assigns, which will include the
+    // wire and the logic assigned to the wire.
+    getBackwardSliceSimple(op, slice, [&slice](Operation *testOp) {
+      return isDataflowOp(testOp) || isa<sv::AssignOp>(testOp) ||
+             (isa<hw::InstanceOp>(testOp) &&
+              resultsOnlyUsedInSlice(testOp, slice));
+    });
+
+    // Add the assign itself, which the above function explicitly doesn't do.
+    slice.insert(op);
   }
 }
 
@@ -110,6 +159,9 @@ static SetVector<Operation *> computeCloneSet(SetVector<Operation *> &roots) {
   SetVector<Operation *> results;
   // Get Dataflow for roots
   dataflowSlice(roots, results);
+
+  // Get limited forms of non-Dataflow into Dataflow slice.
+  nonDataFlowSlice(results);
 
   // Get Blocks
   SetVector<Operation *> blocks;
@@ -224,10 +276,12 @@ static bool hasOoOArgs(hw::HWModuleOp newMod, Operation *op) {
 }
 
 // Do the cloning, which is just a pre-order traversal over the module looking
-// for marked ops.
+// for marked ops. If it can be proved that the marked op is only used in the
+// extracted slice, the old op will be removed.
 static void migrateOps(hw::HWModuleOp oldMod, hw::HWModuleOp newMod,
                        SetVector<Operation *> &depOps,
-                       BlockAndValueMapping &cutMap) {
+                       BlockAndValueMapping &cutMap,
+		       SmallPtrSetImpl<Operation *> &opsToErase) {
   SmallVector<Operation *, 16> lateBoundOps;
   OpBuilder b = OpBuilder::atBlockBegin(newMod.getBodyBlock());
   oldMod.walk<WalkOrder::PreOrder>([&](Operation *op) {
@@ -237,15 +291,18 @@ static void migrateOps(hw::HWModuleOp oldMod, hw::HWModuleOp newMod,
       addBlockMapping(cutMap, op, newOp);
       if (hasOoOArgs(newMod, newOp))
         lateBoundOps.push_back(newOp);
+      if (op->getNumResults() > 0 && resultsOnlyUsedInSlice(op, depOps))
+        opsToErase.insert(op);
     }
   });
   // update any operand which was emitted before it's defining op was.
-  for (auto op : lateBoundOps)
+  for (auto op : lateBoundOps) {
     for (unsigned argidx = 0, e = op->getNumOperands(); argidx < e; ++argidx) {
       Value arg = op->getOperand(argidx);
       if (cutMap.contains(arg))
         op->setOperand(argidx, cutMap.lookup(arg));
     }
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -297,11 +354,10 @@ private:
     auto bmod =
         createModuleForCut(module, inputs, cutMap, suffix, path, bindFile);
     // do the clone
-    migrateOps(module, bmod, opsToClone, cutMap);
-    // erase old operations of interest
-    for (auto op : roots)
-      op->erase();
+    migrateOps(module, bmod, opsToClone, cutMap, opsToErase);
   }
+
+  SmallPtrSet<Operation *, 16> opsToErase;
 };
 
 } // end anonymous namespace
@@ -404,6 +460,17 @@ void SVExtractTestCodeImplPass::runOnOperation() {
       op.removeAttr("firrtl.extract.cover.extra");
       op.removeAttr("firrtl.extract.assume.extra");
     }
+
+  // Remove ops that only existed to feed into the extracted test code,
+  // including the roots themselves. We have checked that all results are being
+  // used by the test code, so the users of each op will also be deleted. It is
+  // safe to drop all uses and remove the ops.
+  for (auto *op : opsToErase) {
+    op->dropAllUses();
+    op->dropAllReferences();
+    op->erase();
+  }
+  opsToErase.clear();
 }
 
 std::unique_ptr<Pass> circt::sv::createSVExtractTestCodePass() {

@@ -19,8 +19,11 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Support/FileUtilities.h"
+#include "llvm/Support/ToolOutputFile.h"
 
 #include <set>
 
@@ -95,10 +98,8 @@ static void dataflowSlice(SetVector<Operation *> &ops,
 
 static bool resultsOnlyUsedInSlice(Operation *op,
                                    const SetVector<Operation *> &slice) {
-  return llvm::all_of(op->getResults(), [slice](OpResult result) {
-    return llvm::all_of(result.getUsers(), [slice](Operation *user) {
-      return slice.contains(user);
-    });
+  return llvm::all_of(op->getUsers(), [slice](Operation *user) {
+    return slice.contains(user);
   });
 }
 
@@ -281,6 +282,7 @@ static bool hasOoOArgs(hw::HWModuleOp newMod, Operation *op) {
 static void migrateOps(hw::HWModuleOp oldMod, hw::HWModuleOp newMod,
                        SetVector<Operation *> &depOps,
                        BlockAndValueMapping &cutMap,
+		       SetVector<Operation *> &roots,
 		       SmallPtrSetImpl<Operation *> &opsToErase) {
   SmallVector<Operation *, 16> lateBoundOps;
   OpBuilder b = OpBuilder::atBlockBegin(newMod.getBodyBlock());
@@ -291,12 +293,20 @@ static void migrateOps(hw::HWModuleOp oldMod, hw::HWModuleOp newMod,
       addBlockMapping(cutMap, op, newOp);
       if (hasOoOArgs(newMod, newOp))
         lateBoundOps.push_back(newOp);
-      if (op->getNumResults() > 0 && resultsOnlyUsedInSlice(op, depOps))
-        opsToErase.insert(op);
+      if (roots.contains(op)) {
+	opsToErase.insert(op);
+      } else if (op->getNumResults() > 0 && resultsOnlyUsedInSlice(op, depOps)) {
+	SetVector<Operation *> forwardSlice;
+	getForwardSlice(op, &forwardSlice);
+	forwardSlice.set_subtract(depOps);
+	if (forwardSlice.empty())
+	  opsToErase.insert(op);
+      }
     }
   });
   // update any operand which was emitted before it's defining op was.
-  for (auto op : lateBoundOps) {
+   for (auto op : lateBoundOps) {
+    op->emitRemark("late bound");
     for (unsigned argidx = 0, e = op->getNumOperands(); argidx < e; ++argidx) {
       Value arg = op->getOperand(argidx);
       if (cutMap.contains(arg))
@@ -316,8 +326,9 @@ struct SVExtractTestCodeImplPass
   void runOnOperation() override;
 
 private:
-  void doModule(hw::HWModuleOp module, std::function<bool(Operation *)> fn,
-                StringRef suffix, Attribute path, Attribute bindFile) {
+  void doModule(
+      hw::HWModuleOp module, std::function<bool(Operation *)> fn,
+      StringRef suffix, Attribute path, Attribute bindFile) {
     bool hasError = false;
     // Find Operations of interest.
     SetVector<Operation *> roots;
@@ -354,7 +365,8 @@ private:
     auto bmod =
         createModuleForCut(module, inputs, cutMap, suffix, path, bindFile);
     // do the clone
-    migrateOps(module, bmod, opsToClone, cutMap, opsToErase);
+    migrateOps(module, bmod, opsToClone, cutMap, roots, opsToErase);
+    return;
   }
 
   SmallPtrSet<Operation *, 16> opsToErase;
@@ -461,16 +473,13 @@ void SVExtractTestCodeImplPass::runOnOperation() {
       op.removeAttr("firrtl.extract.assume.extra");
     }
 
-  // Remove ops that only existed to feed into the extracted test code,
-  // including the roots themselves. We have checked that all results are being
-  // used by the test code, so the users of each op will also be deleted. It is
-  // safe to drop all uses and remove the ops.
   for (auto *op : opsToErase) {
-    op->dropAllUses();
-    op->dropAllReferences();
-    op->erase();
+    // if (op->use_empty() || llvm::all_of(op->getUsers(), [&](Operation *user){ return opsToErase.contains(user); })) {
+      op->dropAllUses();
+      op->erase();
+      ++numErasedOps;
+    // }
   }
-  opsToErase.clear();
 }
 
 std::unique_ptr<Pass> circt::sv::createSVExtractTestCodePass() {

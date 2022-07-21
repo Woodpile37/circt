@@ -112,6 +112,9 @@ def SVExtractTestCode : Pass<"sv-extract-test-code", "ModuleOp"> {
 
   let constructor = "circt::sv::createSVExtractTestCodePass()";
   let dependentDialects = ["circt::sv::SVDialect"];
+  let statistics = [
+    Statistic<"numErasedOps", "num-erased-ops", "Number of ops erased">
+  ];
 }
 
 def HWExportModuleHierarchy : Pass<"hw-export-module-hierarchy",

@@ -608,6 +608,11 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     } else {
       pm.addPass(sv::createHWMemSimImplPass(replSeqMem, ignoreReadEnableMem));
 
+      std::string mlirOutError;
+      auto mlirFile = openOutputFile("before-etc.mlir", &mlirOutError);
+      module->print(mlirFile->os());
+      mlirFile->keep();
+
       if (extractTestCode)
         pm.addPass(sv::createSVExtractTestCodePass());
 

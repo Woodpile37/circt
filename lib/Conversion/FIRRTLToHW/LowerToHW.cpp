@@ -36,6 +36,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Parallel.h"
 
 using namespace circt;
@@ -46,6 +47,9 @@ using hw::PortDirection;
 /// Attribute that indicates that the module hierarchy starting at the
 /// annotated module should be dumped to a file.
 static const char moduleHierarchyFileAttrName[] = "firrtl.moduleHierarchyFile";
+
+/// Width of the source of random values, usually $random.
+constexpr uint64_t randomSourceWidth = 32;
 
 /// Given a FIRRTL type, return the corresponding type for the HW dialect.
 /// This returns a null type if it cannot be lowered.
@@ -1033,6 +1037,9 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
     newModule->setAttr("output_file", outputFile);
   if (auto comment = oldModule->getAttrOfType<StringAttr>("comment"))
     newModule.setCommentAttr(comment);
+  if (auto randomWidth =
+          oldModule->getAttrOfType<IntegerAttr>("firrtl.random_init_width"))
+    newModule->setAttr("firrtl.random_init_width", randomWidth);
 
   // If the circuit has an entry point, set all other modules private.
   // Otherwise, mark all modules as public.
@@ -1387,8 +1394,10 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   Backedge setBackedgeLowering(Value orig, Type result);
   Backedge getBackedgeLowering(Value value);
   void emitRandomizePrologIfNeeded();
-  void initializeRegister(Value reg, llvm::Optional<std::pair<Value, Value>>
-                                         asyncRegResetInitPair = llvm::None);
+  void emitRandomRegister();
+  void initializeRegister(Value reg, uint64_t randomStart, uint64_t randomEnd,
+                          llvm::Optional<std::pair<Value, Value>>
+                              asyncRegResetInitPair = llvm::None);
 
   void runWithInsertionPointAtEndOfBlock(std::function<void(void)> fn,
                                          Region &region);
@@ -1639,6 +1648,8 @@ LogicalResult FIRRTLModuleLowering::lowerModuleOperations(
 
 // This is the main entrypoint for the lowering pass.
 LogicalResult FIRRTLLowering::run() {
+  emitRandomRegister();
+
   // FIRRTL FModule is a single block because FIRRTL ops are a DAG.  Walk
   // through each operation, lowering each in turn if we can, introducing
   // casts if we cannot.
@@ -2521,13 +2532,97 @@ void FIRRTLLowering::emitRandomizePrologIfNeeded() {
   randomizePrologEmitted = true;
 }
 
+void FIRRTLLowering::emitRandomRegister() {
+  auto randomWidthAttr =
+      theModule->getAttrOfType<IntegerAttr>("firrtl.random_init_width");
+  if (!randomWidthAttr)
+    return;
+
+  uint64_t randomWidth = randomWidthAttr.getUInt();
+  uint64_t numRandomSources = llvm::divideCeil(randomWidth, randomSourceWidth);
+  uint64_t randomRegWidth = randomSourceWidth * numRandomSources;
+
+  // The point in the design where we should add randomization register
+  // definitions.  This is at the top of the "`ifndef SYNTHESIS" block.
+  builder.setInsertionPointToStart(theModule.getBodyBlock());
+
+  auto randomInit = [&]() {
+    theModule->removeAttr("firrtl.random_init_width");
+
+    auto randReg = builder.create<sv::RegOp>(
+        builder.getLoc(), builder.getIntegerType(randomRegWidth),
+        /*name=*/builder.getStringAttr("_RANDOM"),
+        /*inner_sym=*/
+        builder.getStringAttr(moduleNamespace.newName(Twine("_RANDOM"))));
+
+    SmallString<32> randomRegAssign("{{0}} = {");
+
+    for (uint64_t i = 0; i < numRandomSources; ++i) {
+      randomRegAssign.append("`RANDOM");
+      if (i < numRandomSources - 1)
+        randomRegAssign.append(",");
+    }
+
+    randomRegAssign.append("};");
+
+    builder.create<sv::VerbatimOp>(
+        builder.getStringAttr(randomRegAssign), ValueRange{},
+        builder.getArrayAttr({hw::InnerRefAttr::get(
+            theModule.getNameAttr(), randReg.getInnerSymAttr())}));
+
+    blockRandomValueAndRemain[builder.getBlock()] = {randReg, randomRegWidth};
+  };
+
+  // Emit the initializer expression for simulation that fills it with random
+  // value.
+
+  addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
+    addToOrderedBlock([&]() {
+      addToIfDefBlock("RANDOMIZE_REG_INIT", std::function<void()>(),
+                      std::function<void()>());
+
+      addToIfDefBlock(
+          "FIRRTL_BEFORE_INITIAL",
+          [&] {
+            if (!areFIRRTLBeforeAndAfterInitialEmitted)
+              builder.create<sv::VerbatimOp>("`FIRRTL_BEFORE_INITIAL");
+          },
+          std::function<void()>());
+
+      addToInitialBlock([&]() {
+        emitRandomizePrologIfNeeded();
+        circuitState.used_RANDOMIZE_REG_INIT = 1;
+        auto *block = builder.getBlock();
+
+        // Randomized values are assigned to registers in `ifdef
+        // RANDOMIZE_REG_INIT block.
+        auto &op = randomizeRegInitIfOp[block];
+        if (!op)
+          op = builder.create<sv::IfDefProceduralOp>("RANDOMIZE_REG_INIT",
+                                                     [&]() {});
+        runWithInsertionPointAtEndOfBlock(randomInit, op.getThenRegion());
+      });
+
+      addToIfDefBlock(
+          "FIRRTL_AFTER_INITIAL",
+          [&] {
+            if (!areFIRRTLBeforeAndAfterInitialEmitted) {
+              builder.create<sv::VerbatimOp>("`FIRRTL_AFTER_INITIAL");
+              areFIRRTLBeforeAndAfterInitialEmitted = true;
+            }
+          },
+          std::function<void()>());
+    });
+  });
+}
+
 void FIRRTLLowering::initializeRegister(
-    Value reg, llvm::Optional<std::pair<Value, Value>> asyncRegResetInitPair) {
+    Value reg, uint64_t randomStart, uint64_t randomEnd,
+    llvm::Optional<std::pair<Value, Value>> asyncRegResetInitPair) {
   typedef std::pair<Attribute, std::pair<unsigned, unsigned>> SymbolAndRange;
 
   // The point in the design where we should add randomization register
   // definitions.  This is at the top of the "`ifndef SYNTHESIS" block.
-  mlir::OpBuilder::InsertPoint regInsertionPoint;
 
   auto regDef = cast<sv::RegOp>(reg.getDefiningOp());
   if (!regDef->hasAttrOfType<StringAttr>("inner_sym"))
@@ -2536,55 +2631,18 @@ void FIRRTLLowering::initializeRegister(
   auto regDefSym =
       hw::InnerRefAttr::get(theModule.getNameAttr(), regDef.getInnerSymAttr());
 
-  // Construct and return a new reference to `RANDOM.  It is always a 32-bit
-  // unsigned expression.  Calls to $random have side effects, so we use
-  // VerbatimExprSEOp.
-  constexpr unsigned randomWidth = 32;
-  auto getRandom32Val = [&](Twine suffix = "") -> Value {
-    sv::RegOp randReg;
-    {
-      OpBuilder::InsertionGuard topBuilder(builder);
-      builder.restoreInsertionPoint(regInsertionPoint);
-      randReg = builder.create<sv::RegOp>(
-          reg.getLoc(), builder.getIntegerType(randomWidth),
-          /*name=*/builder.getStringAttr("_RANDOM"),
-          /*inner_sym=*/
-          builder.getStringAttr(moduleNamespace.newName(Twine("_RANDOM"))));
-    }
-
-    builder.create<sv::VerbatimOp>(
-        builder.getStringAttr(Twine("{{0}} = {`RANDOM};")), ValueRange{},
-        builder.getArrayAttr({hw::InnerRefAttr::get(
-            theModule.getNameAttr(), randReg.getInnerSymAttr())}));
-
-    return randReg.getResult();
-  };
-
   auto getRandomValues = [&](IntegerType type,
                              SmallVector<SymbolAndRange> &values) {
     auto width = type.getWidth();
     assert(width != 0 && "zero bit width's not supported");
-    while (width > 0) {
-      auto &randomValueAndRemain =
-          blockRandomValueAndRemain[builder.getBlock()];
+    auto &randomValueAndRemain = blockRandomValueAndRemain[builder.getBlock()];
 
-      // If there are no bits left, then generate a new random value.
-      if (!randomValueAndRemain.second)
-        randomValueAndRemain = {getRandom32Val("foo"), randomWidth};
+    auto reg = cast<sv::RegOp>(randomValueAndRemain.first.getDefiningOp());
 
-      auto reg = cast<sv::RegOp>(randomValueAndRemain.first.getDefiningOp());
+    auto symbol =
+        hw::InnerRefAttr::get(theModule.getNameAttr(), reg.getInnerSymAttr());
 
-      auto symbol =
-          hw::InnerRefAttr::get(theModule.getNameAttr(), reg.getInnerSymAttr());
-      unsigned low = randomWidth - randomValueAndRemain.second;
-      unsigned high = randomWidth - 1;
-      if (width <= randomValueAndRemain.second)
-        high = width - 1 + low;
-      unsigned consumed = high - low + 1;
-      values.push_back({symbol, {high, low}});
-      randomValueAndRemain.second -= consumed;
-      width -= consumed;
-    }
+    values.push_back({symbol, {randomEnd, randomStart}});
   };
 
   // Get a random value with the specified width, combining or truncating
@@ -2610,7 +2668,7 @@ void FIRRTLLowering::initializeRegister(
       rhs.append(("{{" + Twine(i++) + "}}").str());
 
       // This uses all bits of the random value. Emit without part select.
-      if (high == randomWidth - 1 && low == 0)
+      if (high == randomSourceWidth - 1 && low == 0)
         continue;
 
       // Emit a single bit part select, e.g., emit "[0]" and not "[0:0]".
@@ -2657,22 +2715,7 @@ void FIRRTLLowering::initializeRegister(
 
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToOrderedBlock([&]() {
-      addToIfDefBlock(
-          "RANDOMIZE_REG_INIT",
-          [&]() { regInsertionPoint = builder.saveInsertionPoint(); },
-          std::function<void()>());
-
-      addToIfDefBlock(
-          "FIRRTL_BEFORE_INITIAL",
-          [&] {
-            if (!areFIRRTLBeforeAndAfterInitialEmitted)
-              builder.create<sv::VerbatimOp>("`FIRRTL_BEFORE_INITIAL");
-          },
-          std::function<void()>());
-
       addToInitialBlock([&]() {
-        emitRandomizePrologIfNeeded();
-        circuitState.used_RANDOMIZE_REG_INIT = 1;
         auto *block = builder.getBlock();
 
         // Randomized values are assigned to registers in `ifdef
@@ -2701,16 +2744,6 @@ void FIRRTLLowering::initializeRegister(
               op.getThenRegion());
         }
       });
-
-      addToIfDefBlock(
-          "FIRRTL_AFTER_INITIAL",
-          [&] {
-            if (!areFIRRTLBeforeAndAfterInitialEmitted) {
-              builder.create<sv::VerbatimOp>("`FIRRTL_AFTER_INITIAL");
-              areFIRRTLBeforeAndAfterInitialEmitted = true;
-            }
-          },
-          std::function<void()>());
     });
   });
 }
@@ -2730,7 +2763,11 @@ LogicalResult FIRRTLLowering::visitDecl(RegOp op) {
       builder.create<sv::RegOp>(resultType, op.getNameAttr(), symName);
   (void)setLowering(op, regResult);
 
-  initializeRegister(regResult);
+  auto randomStart =
+      op->getAttrOfType<IntegerAttr>("firrtl.random_init_start").getUInt();
+  auto randomEnd =
+      op->getAttrOfType<IntegerAttr>("firrtl.random_init_end").getUInt();
+  initializeRegister(regResult, randomStart, randomEnd);
 
   return success();
 }
@@ -2774,7 +2811,11 @@ LogicalResult FIRRTLLowering::visitDecl(RegResetOp op) {
   llvm::Optional<std::pair<Value, Value>> asyncRegResetInitPair;
   if (op.getResetSignal().getType().isa<AsyncResetType>())
     asyncRegResetInitPair = {resetSignal, resetValue};
-  initializeRegister(regResult, asyncRegResetInitPair);
+  auto randomStart =
+      op->getAttrOfType<IntegerAttr>("firrtl.random_init_start").getUInt();
+  auto randomEnd =
+      op->getAttrOfType<IntegerAttr>("firrtl.random_init_end").getUInt();
+  initializeRegister(regResult, randomStart, randomEnd, asyncRegResetInitPair);
   return success();
 }
 

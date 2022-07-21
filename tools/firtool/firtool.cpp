@@ -572,6 +572,9 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   if (extractInstances)
     pm.addNestedPass<firrtl::CircuitOp>(firrtl::createExtractInstancesPass());
 
+  pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+      firrtl::createRandomizeRegisterInitPass());
+
   // Run passes to resolve Grand Central features.  This should run before
   // BlackBoxReader because Grand Central needs to inform BlackBoxReader where
   // certain black boxes should be placed.

@@ -13,6 +13,7 @@ add_circt_library(CIRCTSupport
   APInt.cpp
   ValueMapper.cpp
   SymCache.cpp
+  CDE.cpp
   "${VERSION_CPP}"
 
   ADDITIONAL_HEADER_DIRS
